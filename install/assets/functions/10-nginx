@@ -1,0 +1,260 @@
+#!/command/with-contenv bash
+
+# Check for legacy Nginx configurations and migrate them to the new structure.
+# This function identifies the deprecated `/etc/nginx/conf.d/` directory and moves its content
+# to `/etc/nginx/sites.available` to align with modern configuration practices.
+nginx_check_legacy_configuration() {
+    if [ -d "/etc/nginx/conf.d/" ]; then
+        # Copy existing files from legacy directory to the new configuration path
+        silent cp -R /etc/nginx/conf.d/* /etc/nginx/sites.available
+
+        # Notify the user about the legacy configuration and migration
+        print_warn "Found old legacy /etc/nginx/conf.d folder - Please switch to the new method of Nginx configuration using /etc/nginx/sites.available - Moving all files to /etc/nginx/sites.available"
+
+        # Rename the legacy directory for backup purposes
+        silent mv /etc/nginx/conf.d /etc/nginx/conf.d.legacy
+    fi
+}
+
+# Group for general Nginx configuration.
+# This section includes functions to configure global Nginx settings such as authentication, logging, maintenance mode, and more.
+# The authentication configuration function supports multiple methods, including Basic, LDAP, and LLNG.
+nginx_configure_authentication() {
+    ### Map Authentication
+    case "${NGINX_AUTHENTICATION_TYPE,,}" in
+        # Basic authentication configuration
+        "basic")
+            print_notice "Setting Basic Authentication"
+
+            # Count the number of users defined in environment variables
+            user_num=$(printenv | sort | grep -c 'NGINX_AUTHENTICATION_BASIC_USER.*')
+
+            # Loop through users and create the authentication file
+            for ((i = 1; i <= user_num; i++)); do
+                transform_file_var \
+                    NGINX_AUTHENTICATION_BASIC_USER${i} \
+                    NGINX_AUTHENTICATION_BASIC_PASS${i}
+
+                basic_user=NGINX_AUTHENTICATION_BASIC_USER${i}
+                basic_pass=NGINX_AUTHENTICATION_BASIC_PASS${i}
+
+                print_warn "Creating User: ${!basic_user}"
+                htpasswd -b -n "${!basic_user:-$NGINX_AUTHENTICATION_BASIC_USER}" "${!basic_pass:-$NGINX_AUTHENTICATION_BASIC_PASS}" >> /etc/nginx/snippets/authentication/basic_authorized_users
+            done
+        ;;
+
+        # LDAP authentication configuration
+        "ldap")
+            transform_file_var \
+                NGINX_AUTHENTICATION_LDAP_HOST \
+                NGINX_AUTHENTICATION_LDAP_PORT \
+                NGINX_AUTHENTICATION_LDAP_BASE_DN \
+                NGINX_AUTHENTICATION_LDAP_BIND_DN \
+                NGINX_AUTHENTICATION_LDAP_BIND_PW
+
+            # Generate LDAP server configuration for Nginx
+            cat <<EOF > /etc/nginx/snippets/authentication/ldap_configuration
+        ldap_server ldapserver {
+          url "${NGINX_AUTHENTICATION_LDAP_HOST}/${NGINX_AUTHENTICATION_LDAP_BASE_DN}?${NGINX_AUTHENTICATION_LDAP_ATTRIBUTE}?${NGINX_AUTHENTICATION_LDAP_SCOPE}?${NGINX_AUTHENTICATION_LDAP_FILTER}";
+          binddn "${NGINX_AUTHENTICATION_LDAP_BIND_DN}";
+          binddn_passwd ${NGINX_AUTHENTICATION_LDAP_BIND_PW};
+          group_attribute ${NGINX_AUTHENTICATION_LDAP_GROUP_ATTRIBUTE};
+          group_attribute_is_dn on;
+          require valid_user;
+          satisfy all;
+        }
+EOF
+            # Include the LDAP configuration snippet in Nginx's main configuration
+            sed -i "\|include /etc/nginx/sites.enabled| i\ \ \ \ include /etc/nginx/snippets/authentication/ldap_configuration;" /etc/nginx/nginx.conf
+        ;;
+
+        # LLNG (LemonLDAP::NG) authentication configuration
+        "llng")
+            print_notice "Setting LLNG Authentication"
+
+            # Handle upstream keepalive setting
+            if var_true "${NGINX_ENABLE_UPSTREAM_KEEPALIVE}" ; then
+                upstream_keepalive="keepalive ${NGINX_UPSTREAM_KEEPALIVE};"
+            fi
+
+            transform_file_var \
+                NGINX_AUTHENTICATION_LLNG_HANDLER_HOST \
+                NGINX_AUTHENTICATION_LLNG_HANDLER_PORT
+
+            llng_upstream_hosts=$(echo "${NGINX_AUTHENTICATION_LLNG_HANDLER_HOST}" | tr "," "\n")
+
+            # Generate upstream configuration
+            echo "upstream llng-upstream-pool {" >> /etc/nginx/snippets/authentication/llng_upstream
+            echo "     ${upstream_keepalive}" >> /etc/nginx/snippets/authentication/llng_upstream
+
+            for host in $llng_upstream_hosts; do
+                if [[ ${host} != *":"* ]];then
+                    llng_handler_listen_port=":${NGINX_AUTHENTICATION_LLNG_HANDLER_PORT}"
+                else
+                    llng_handler_listen_port=""
+                fi
+                echo "    server $host${llng_handler_listen_port} ${NGINX_UPSTREAM_OPTIONS};" >> /etc/nginx/snippets/authentication/llng_upstream
+            done
+            echo "}" >> /etc/nginx/snippets/authentication/llng_upstream
+
+            # Insert upstream configuration into Nginx
+            sed -i -e "/# Do not delete - Upstream Configuration/a\ \ \ \ include \/etc\/nginx\/snippets\/authentication\/llng_upstream;" /etc/nginx/nginx.conf
+            sed -i -e "/# Do not delete - Upstream Configuration/a\ \ \ \ ### LLNG Authentication Multiple Handlers configuration" /etc/nginx/nginx.conf
+
+            update_template /etc/nginx/snippets/authentication/llng_location_block NGINX_AUTHENTICATION_LLNG_HANDLER_PORT
+
+            # Configure additional LLNG attributes if PHP-FPM is not managing them
+            if [ ! -f "/etc/cont-init.d/20-php-fpm" ]; then
+                header_num=$(printenv | sort | grep -c '^NGINX_AUTHENTICATION_LLNG_ATTRIBUTE.*')
+                for ((i = 1; i <= header_num; i++)); do
+                    headers=NGINX_AUTHENTICATION_LLNG_ATTRIBUTE${i}
+                    IFS=',' read -r -a array <<<"${!headers}"
+                    print_notice "Updating Nginx to support receiving attribute from LLNG: '${array[0]}'"
+                    echo "fastcgi_param ${array[0]} \$${array[1]};" >> /etc/nginx/snippets/authentication/llng_params
+                    echo "auth_request_set \$${array[1]} \$${array[2]};" >> /etc/nginx/snippets/authentication/llng_auth_request
+                done
+            else
+                print_debug "Skipping LLNG Authentication configuration until configured by PHP-FPM"
+            fi
+        ;;
+
+        # No authentication
+        "none")
+            :
+        ;;
+
+        # Unknown authentication type fallback
+        *)
+            print_warn "Unknown NGINX_AUTHENTICATION_TYPE '${NGINX_AUTHENTICATION_TYPE}. Reverting to no/application authentication"
+        ;;
+    esac
+}
+
+# Configure bot blocking for Nginx.
+# This function sets up rules to block unwanted bots by managing blacklist and whitelist configurations
+# for user agents, IP addresses, and referrer domains. It also supports adding custom bot-blocking rules.
+nginx_configure_blockbots() {
+    ### Include blockbots configuration into site configurations
+    sed -i "\|### Don't edit past here|a\ \ \ \ \  include /etc/nginx/snippets/blockbots/ddos.conf;" /etc/nginx/sites.available/*.conf
+
+    ### Ensure required custom configuration files exist
+    for config in bad-referrer-words.conf blacklist-ips.conf blacklist-user-agents.conf \
+                  custom-bad-referrers.conf whitelist-ips.conf whitelist-domains.conf; do
+        if [ ! -f "/etc/nginx/snippets/blockbots-custom/${config}" ]; then
+            cp -R "/etc/nginx/snippets/blockbots/${config}" "/etc/nginx/snippets/blockbots-custom/"
+        fi
+    done
+
+    ### Handle custom bot-blocking configurations from assets
+    if [ -d "/assets/nginx/blockbots-custom" ] ; then
+        print_notice "Detected Custom Bot Blocking configuration"
+        cp -R /assets/nginx/blockbots-custom/* /etc/nginx/snippets/blockbots-custom/
+    fi
+
+    ### Manage whitelist domains
+    if [ -n "${NGINX_BLOCK_BOTS_WHITELIST_DOMAIN}" ]; then
+        whitelist_domains=$(echo "${NGINX_BLOCK_BOTS_WHITELIST_DOMAIN,,}" | tr "," "\n")
+        for wl_domain in $whitelist_domains; do
+            wl_domain_orig=${wl_domain}
+            wl_domain="$(echo "$wl_domain" | sed "s|\\.|\\\.|g" | sed "s|-|\\\-|g")"
+            if ! grep -q "${wl_domain_orig}" /etc/nginx/snippets/blockbots-custom/whitelist-domains.conf ; then
+                print_debug  "Adding '${wl_domain_orig}' domain to bot blocker whitelist"
+                echo '"~*(?:\b)'$(echo "$wl_domain")'(?:\b)" 0;' $(echo " # ${wl_domain_orig} automatically added on") $(date +"%Y-%m-%d-%H:%M:%S") >> /etc/nginx/snippets/blockbots-custom/whitelist-domains.conf
+            elsebolster-zipping-tartly-swimsuit
+                print_debug "Skipping '${wl_domain_orig}' to be added to bot blocker domain whitelist"
+            fi
+        done
+    fi
+
+    ### Manage whitelist IPs
+    if [ -n "${NGINX_BLOCK_BOTS_WHITELIST_IP}" ]; then
+        whitelist_ips=$(echo "${NGINX_BLOCK_BOTS_WHITELIST_IP}" | tr "," "\n")
+        for wl_ip in $whitelist_ips; do
+            if ! grep -q "${wl_ip}" /etc/nginx/snippets/blockbots-custom/whitelist-ips.conf ; then
+                print_debug  "Adding IP: '${wl_ip}' to bot blocker whitelist"
+                echo "${wl_ip} 0; # Automatically added on $(date +"%Y-%m-%d-%H:%M:%S")" >> /etc/nginx/snippets/blockbots-custom/whitelist-ips.conf
+            else
+                print_debug "Skipping IP: '${wl_ip}' from being added to bot blocker IP whitelist"
+            fi
+        done
+    fi
+
+    ### Manage bot blacklists
+    if [ -n "${NGINX_BLOCK_BOTS}" ] ; then
+        if [[ "${NGINX_BLOCK_BOTS,,}" == *"all" ]] ; then
+            NGINX_BLOCK_BOTS=ALL
+        fi
+
+        IFS=","
+        for bot in $NGINX_BLOCK_BOTS ; do
+            case "${bot,,}" in
+                "all" )
+                    nginx_block_bots="adidxbot,aolbuild,bingbot,bingpreview,DoCoMo,duckduckgo,facebookexternalhit,facebookplatform,AdsBot-Google,Googlebot,Googlebot-Image,Googlebot-Mobile,Googlebot-News,Googlebot/Test,Googlebot-Video,Google-HTTP-Java-Client,LinkedInBot,Gravityscan,Jakarta\\ Commons,Kraken/0.1,teoma,msnbot,msnbot-media,SAMSUNG,Slackbot,Slackbot-LinkExpanding,slurp,TwitterBot,Wordpress,yahoo"
+                ;;
+                "aol" )
+                    nginx_block_bots="aolbuild,${nginx_block_bots}"
+                ;;
+                "bing" )
+                    nginx_block_bots="bingbot,bingpreview,${nginx_block_bots}"
+                ;;
+                "docomo" )
+                    nginx_block_bots="DoCoMo,${nginx_block_bots}"
+                ;;
+                "duckduckgo" )
+                    nginx_block_bots="duckduckgo,${nginx_block_bots}"
+                ;;
+                "facebook" )
+                    nginx_block_bots="developers.facebook.com,facebookexternalhit,facebookplatform,${nginx_block_bots}"
+                ;;
+                "google" )
+                    nginx_block_bots="AdsBot-Google,Googlebot,Googlebot-Image,Googlebot-Mobile,Googlebot-News,Googlebot/Test,Googlebot-Video,Google-HTTP-Java-Client,${nginx_block_bots}"
+                ;;
+                "linkedin" )
+                    nginx_block_bots="LinkedInBot,${nginx_block_bots}"
+                ;;
+                "misc" )
+                    nginx_block_bots="adidxbot,Gravityscan,'Jakarta\ Commons',Kraken/0.1,teoma,${nginx_block_bots}"
+                ;;
+                "msn" )
+                    nginx_block_bots="msnbot,msnbot-media,${nginx_block_bots}"
+                ;;
+                "samsung" )
+                    nginx_block_bots="SAMSUNG,${nginx_block_bots}"
+                ;;
+                "slack" )
+                    nginx_block_bots="Slackbot,Slackbot-LinkExpanding,${nginx_block_bots}"
+                ;;
+                "slurp" )
+                    nginx_block_bots="slurp,${nginx_block_bots}"
+                ;;
+                "twitter" )
+                    nginx_block_bots="TwitterBot,${nginx_block_bots}"
+                ;;
+                "wordpress" )
+                    nginx_block_bots="Wordpress,${nginx_block_bots}"
+                ;;
+                "yahoo" )
+                    nginx_block_bots="yahoo,${nginx_block_bots}"
+                ;;
+                * )
+                    nginx_block_bots="${bot},${nginx_block_bots}"
+                ;;
+            esac
+        done
+        NGINX_BLOCK_BOTS_BLACKLIST_USER_AGENTS="${nginx_block_bots}"
+    fi
+
+    ### Update blacklist user agents
+    if [ -n "${NGINX_BLOCK_BOTS_BLACKLIST_USER_AGENTS}" ]; then
+        IFS=","
+        for blacklist_ua in $NGINX_BLOCK_BOTS_BLACKLIST_USER_AGENTS; do
+            blacklist_ua_orig="$(echo "$blacklist_ua" | sed "s|\\\||g")"
+            if ! grep -q "${blacklist_ua_orig}" /etc/nginx/snippets/blockbots-custom/blacklist-user-agents.conf ; then
+                print_debug  "[botblock] Adding UA: '${blacklist_ua_orig}' to bot blocker blacklist"
+                echo '"~*(?:\b)'$(echo "$blacklist_ua")'(?:\b)" 3; # '${blacklist_ua_orig}' Automatically added on '$(date +"%Y-%m-%d-%H:%M:%S") >> /etc/nginx/snippets/blockbots-custom/blacklist-user-agents.conf
+            else
+                print_debug "Skipping UA: '${blacklist_ua_orig}' from being added to bot blocker blacklist"
+            fi
+        done
+    fi
+}
